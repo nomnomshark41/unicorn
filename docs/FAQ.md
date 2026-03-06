@@ -119,7 +119,7 @@ Note that for cortex-m `exec_return`, Unicorn has a magic software exception wit
 
 ## Why not keep up the upstream qemu?
 
-To provide end users with simple API, Unicorn does lots of dirty hacks within qemu code which prevents it from sync painlessly.
+To provide end users with simple API, Unicorn does lots of dirty hacks within qemu code which prevents it from sync painlessly. For a full catalogue of these hacks, see [HACKS.md](HACKS.md).
 
 ## Is there anyway to disable softmmu to speed up execution?
 
