@@ -1208,7 +1208,7 @@ static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
     // - have memory hooks installed
     // - or doing snapshot
     // , then never clean the tlb
-    if (!(!mr || (tlbe->addr_write != -1 && mr->priority < cpu->uc->snapshot_level)) &&
+    if (!(!mr || (tlbe->addr_write != -1 && mr->priority < cpu->uc->unicorn.snapshot_level)) &&
             !(tlbe->addr_code != -1) &&
             !uc_mem_hook_installed(cpu->uc, tlbe->paddr | (mem_vaddr & ~TARGET_PAGE_MASK))) {
         tlb_set_dirty(cpu, mem_vaddr);
@@ -2309,7 +2309,7 @@ store_helper(CPUArchState *env, target_ulong addr, uint64_t val,
         }
     }
 
-    if (uc->snapshot_level && mr->ram && mr->priority < uc->snapshot_level) {
+    if (uc->unicorn.snapshot_level && mr->ram && mr->priority < uc->unicorn.snapshot_level) {
         mr = memory_cow(uc, mr, paddr & TARGET_PAGE_MASK, TARGET_PAGE_SIZE);
         if (!mr) {
             uc->invalid_addr = paddr;

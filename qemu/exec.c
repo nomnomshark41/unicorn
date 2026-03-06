@@ -1396,7 +1396,7 @@ static subpage_t *subpage_init(struct uc_struct *uc, FlatView *fv, hwaddr base)
     memory_region_init_io(fv->root->uc, &mmio->iomem, &subpage_ops, mmio,
                           TARGET_PAGE_SIZE);
     mmio->iomem.subpage = true;
-    mmio->iomem.priority = uc->snapshot_level;
+    mmio->iomem.priority = uc->unicorn.snapshot_level;
 #if defined(DEBUG_SUBPAGE)
     printf("%s: %p base " TARGET_FMT_plx " len %08x\n", __func__,
            mmio, base, TARGET_PAGE_SIZE);
@@ -1464,7 +1464,7 @@ void address_space_dispatch_clear(AddressSpaceDispatch *d)
     while (d->map.sections_nb > 0) {
         d->map.sections_nb--;
         section = &d->map.sections[d->map.sections_nb];
-        if (section->mr->priority > uc->snapshot_level) {
+        if (section->mr->priority > uc->unicorn.snapshot_level) {
             phys_section_destroy(section->mr);
         }
     }

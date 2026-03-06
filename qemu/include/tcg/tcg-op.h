@@ -47,8 +47,8 @@ static inline void gen_uc_tracecode(TCGContext *tcg_ctx, int32_t size, int32_t t
     };
 
     const int hook_type = type & UC_HOOK_IDX_MASK;
-    if (puc->hooks_count[hook_type] == 1 && !(type & UC_HOOK_FLAG_NO_STOP)) {
-        cur = puc->hook[hook_type].head;
+    if (puc->unicorn.hooks_count[hook_type] == 1 && !(type & UC_HOOK_FLAG_NO_STOP)) {
+        cur = puc->unicorn.hook[hook_type].head;
         
         while (cur) {
             hk = cur->data;

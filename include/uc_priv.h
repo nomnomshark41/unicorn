@@ -240,7 +240,7 @@ typedef enum uc_hook_idx {
 
 // for loop macro to loop over hook lists
 #define HOOK_FOREACH(uc, hh, idx)                                              \
-    for (cur = (uc)->hook[idx##_IDX].head;                                     \
+    for (cur = (uc)->unicorn.hook[idx##_IDX].head;                             \
          cur != NULL && ((hh) = (struct hook *)cur->data); cur = cur->next)
 
 // if statement to check hook bounds
@@ -249,9 +249,9 @@ typedef enum uc_hook_idx {
       (hh)->begin > (hh)->end) &&                                              \
      !((hh)->to_delete))
 
-#define HOOK_EXISTS(uc, idx) ((uc)->hook[idx##_IDX].head != NULL)
+#define HOOK_EXISTS(uc, idx) ((uc)->unicorn.hook[idx##_IDX].head != NULL)
 #define HOOK_EXISTS_BOUNDED(uc, idx, addr)                                     \
-    _hook_exists_bounded((uc)->hook[idx##_IDX].head, addr)
+    _hook_exists_bounded((uc)->unicorn.hook[idx##_IDX].head, addr)
 
 static inline bool _hook_exists_bounded(struct list_item *cur, uint64_t addr)
 {
@@ -268,6 +268,25 @@ static inline bool _hook_exists_bounded(struct list_item *cur, uint64_t addr)
 
 typedef struct TargetPageBits TargetPageBits;
 typedef struct TCGContext TCGContext;
+
+// Unicorn-specific VM state, separated from QEMU internals.
+// Contains hook lists, mapped-memory bookkeeping, and snapshot level.
+typedef struct UnicornVM {
+    // Hook lists, one per hook type
+    struct list hook[UC_HOOK_MAX];
+    struct list hooks_to_del;
+    int hooks_count[UC_HOOK_MAX];
+    uc_hook count_hook;     // instruction-count hook for uc_emu_start()
+    bool hook_insert;       // if true, insert hooks at list head (not tail)
+
+    // Mapped memory blocks (sorted by address)
+    MemoryRegion **mapped_blocks;
+    uint32_t mapped_block_count;
+    uint32_t mapped_block_cache_index;
+
+    // Copy-on-write snapshot depth
+    int32_t snapshot_level;
+} UnicornVM;
 
 struct uc_struct {
     uc_arch arch;
@@ -358,13 +377,8 @@ struct uc_struct {
 
     uc_set_tlb_t set_tlb;
 
-    // linked lists containing hooks per type
-    struct list hook[UC_HOOK_MAX];
-    struct list hooks_to_del;
-    int hooks_count[UC_HOOK_MAX];
-
-    // hook to count number of instructions for uc_emu_start()
-    uc_hook count_hook;
+    // Unicorn-specific VM state (hooks, mapped memory blocks, snapshot level)
+    UnicornVM unicorn;
 
     size_t emu_counter; // current counter of uc_emu_start()
     size_t emu_count;   // save counter of uc_emu_start()
@@ -392,9 +406,6 @@ struct uc_struct {
                       // details.
 
     int thumb; // thumb mode for ARM
-    MemoryRegion **mapped_blocks;
-    uint32_t mapped_block_count;
-    uint32_t mapped_block_cache_index;
     void *qemu_thread_data; // to support cross compile to Windows
                             // (qemu-thread-win32.c)
     uint32_t target_page_size;
@@ -406,8 +417,6 @@ struct uc_struct {
     uc_context_content context_content;
     int cpu_context_size;
     uint64_t next_pc; // save next PC for some special cases
-    bool hook_insert; // insert new hook at begin of the hook list (append by
-                      // default)
     bool first_tb; // is this the first Translation-Block ever generated since
                    // uc_emu_start()?
     bool no_exit_request; // Disable check_exit_request temporarily. A
@@ -427,7 +436,6 @@ struct uc_struct {
     void *seh_closure;
 #endif
     GArray *unmapped_regions;
-    int32_t snapshot_level;
     uint64_t nested; // the nested level of all exposed API
     bool thread_executable_entry;
     bool current_executable;
@@ -516,8 +524,8 @@ static inline void hooked_regions_check(uc_engine *uc, uint64_t start,
                                         uint64_t length)
 {
     // Only UC_HOOK_BLOCK and UC_HOOK_CODE might be wrongle cached!
-    hooked_regions_check_single(uc->hook[UC_HOOK_CODE_IDX].head, start, length);
-    hooked_regions_check_single(uc->hook[UC_HOOK_BLOCK_IDX].head, start,
+    hooked_regions_check_single(uc->unicorn.hook[UC_HOOK_CODE_IDX].head, start, length);
+    hooked_regions_check_single(uc->unicorn.hook[UC_HOOK_BLOCK_IDX].head, start,
                                 length);
 }
 

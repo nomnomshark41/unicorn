@@ -267,7 +267,7 @@ static inline TranslationBlock *tb_find(CPUState *cpu,
         if (uc->last_tb) {
             UC_TB_COPY(&cur_tb, tb);
             UC_TB_COPY(&prev_tb, uc->last_tb);
-            for (cur = uc->hook[UC_HOOK_EDGE_GENERATED_IDX].head;
+            for (cur = uc->unicorn.hook[UC_HOOK_EDGE_GENERATED_IDX].head;
                 cur != NULL && (hook = (struct hook *)cur->data); cur = cur->next) {
                 if (hook->to_delete) {
                     continue;

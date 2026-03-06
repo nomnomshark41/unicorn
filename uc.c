@@ -273,10 +273,10 @@ static uc_err uc_init_engine(uc_engine *uc)
         return UC_ERR_HANDLE;
     }
 
-    uc->hooks_to_del.delete_fn = hook_delete;
+    uc->unicorn.hooks_to_del.delete_fn = hook_delete;
 
     for (int i = 0; i < UC_HOOK_MAX; i++) {
-        uc->hook[i].delete_fn = hook_delete;
+        uc->unicorn.hook[i].delete_fn = hook_delete;
     }
 
     uc->ctl_exits = g_tree_new_full(uc_exits_cmp, NULL, g_free, NULL);
@@ -560,10 +560,10 @@ uc_err uc_close(uc_engine *uc)
     clear_deleted_hooks(uc);
 
     for (i = 0; i < UC_HOOK_MAX; i++) {
-        list_clear(&uc->hook[i]);
+        list_clear(&uc->unicorn.hook[i]);
     }
 
-    free(uc->mapped_blocks);
+    free(uc->unicorn.mapped_blocks);
 
     g_tree_destroy(uc->ctl_exits);
 
@@ -975,7 +975,7 @@ uc_err uc_mem_write(uc_engine *uc, uint64_t address, const void *_bytes,
             }
 
             len = memory_region_len(uc, mr, address, size - count);
-            if (uc->snapshot_level && uc->snapshot_level > mr->priority) {
+            if (uc->unicorn.snapshot_level && uc->unicorn.snapshot_level > mr->priority) {
                 mr = uc->memory_cow(uc, mr, address & ~align,
                                     (len + (address & align) + align) & ~align);
                 if (!mr) {
@@ -1059,17 +1059,17 @@ static void clear_deleted_hooks(uc_engine *uc)
     struct hook *hook;
     int i;
 
-    for (cur = uc->hooks_to_del.head;
+    for (cur = uc->unicorn.hooks_to_del.head;
          cur != NULL && (hook = (struct hook *)cur->data); cur = cur->next) {
         assert(hook->to_delete);
         for (i = 0; i < UC_HOOK_MAX; i++) {
-            if (list_remove(&uc->hook[i], (void *)hook)) {
+            if (list_remove(&uc->unicorn.hook[i], (void *)hook)) {
                 break;
             }
         }
     }
 
-    list_clear(&uc->hooks_to_del);
+    list_clear(&uc->unicorn.hooks_to_del);
 }
 
 UNICORN_EXPORT
@@ -1191,24 +1191,24 @@ uc_err uc_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
 
     uc->emu_count = count;
     // remove count hook if counting isn't necessary
-    if (count <= 0 && uc->count_hook != 0) {
-        uc_hook_del(uc, uc->count_hook);
-        uc->count_hook = 0;
+    if (count <= 0 && uc->unicorn.count_hook != 0) {
+        uc_hook_del(uc, uc->unicorn.count_hook);
+        uc->unicorn.count_hook = 0;
 
         // In this case, we have to drop all translated blocks.
         uc->tb_flush(uc);
     }
     // set up count hook to count instructions.
-    if (count > 0 && uc->count_hook == 0) {
+    if (count > 0 && uc->unicorn.count_hook == 0) {
         uc_err err;
         // callback to count instructions must be run before everything else,
         // so instead of appending, we must insert the hook at the begin
         // of the hook list
-        uc->hook_insert = 1;
-        err = uc_hook_add(uc, &uc->count_hook, UC_HOOK_CODE, hook_count_cb,
+        uc->unicorn.hook_insert = 1;
+        err = uc_hook_add(uc, &uc->unicorn.count_hook, UC_HOOK_CODE, hook_count_cb,
                           NULL, 1, 0);
         // restore to append mode for uc_hook_add()
-        uc->hook_insert = 0;
+        uc->unicorn.hook_insert = 0;
         if (err != UC_ERR_OK) {
             uc->nested_level--;
             return err;
@@ -1277,12 +1277,12 @@ static int bsearch_mapped_blocks(const uc_engine *uc, uint64_t address)
     MemoryRegion *mapping;
 
     left = 0;
-    right = uc->mapped_block_count;
+    right = uc->unicorn.mapped_block_count;
 
     while (left < right) {
         mid = left + (right - left) / 2;
 
-        mapping = uc->mapped_blocks[mid];
+        mapping = uc->unicorn.mapped_blocks[mid];
 
         if (mapping->end - 1 < address) {
             left = mid + 1;
@@ -1305,11 +1305,11 @@ static bool memory_overlap(struct uc_struct *uc, uint64_t begin, size_t size)
     i = bsearch_mapped_blocks(uc, begin);
 
     // is this the highest region with no possible overlap?
-    if (i >= uc->mapped_block_count)
+    if (i >= uc->unicorn.mapped_block_count)
         return false;
 
     // end address overlaps this region?
-    if (end >= uc->mapped_blocks[i]->addr)
+    if (end >= uc->unicorn.mapped_blocks[i]->addr)
         return true;
 
     // not found
@@ -1328,24 +1328,24 @@ static uc_err mem_map(uc_engine *uc, MemoryRegion *block)
         return UC_ERR_NOMEM;
     }
 
-    if ((uc->mapped_block_count & (MEM_BLOCK_INCR - 1)) == 0) { // time to grow
+    if ((uc->unicorn.mapped_block_count & (MEM_BLOCK_INCR - 1)) == 0) { // time to grow
         regions = (MemoryRegion **)g_realloc(
-            uc->mapped_blocks,
-            sizeof(MemoryRegion *) * (uc->mapped_block_count + MEM_BLOCK_INCR));
+            uc->unicorn.mapped_blocks,
+            sizeof(MemoryRegion *) * (uc->unicorn.mapped_block_count + MEM_BLOCK_INCR));
         if (regions == NULL) {
             return UC_ERR_NOMEM;
         }
-        uc->mapped_blocks = regions;
+        uc->unicorn.mapped_blocks = regions;
     }
 
     pos = bsearch_mapped_blocks(uc, block->addr);
 
     // shift the array right to give space for the new pointer
-    memmove(&uc->mapped_blocks[pos + 1], &uc->mapped_blocks[pos],
-            sizeof(MemoryRegion *) * (uc->mapped_block_count - pos));
+    memmove(&uc->unicorn.mapped_blocks[pos + 1], &uc->unicorn.mapped_blocks[pos],
+            sizeof(MemoryRegion *) * (uc->unicorn.mapped_block_count - pos));
 
-    uc->mapped_blocks[pos] = block;
-    uc->mapped_block_count++;
+    uc->unicorn.mapped_blocks[pos] = block;
+    uc->unicorn.mapped_block_count++;
 
     return UC_ERR_OK;
 }
@@ -1722,7 +1722,7 @@ uc_err uc_mem_protect(struct uc_struct *uc, uint64_t address, uint64_t size,
     UC_INIT(uc);
 
     // snapshot and protection can't be mixed
-    if (uc->snapshot_level > 0) {
+    if (uc->unicorn.snapshot_level > 0) {
         restore_jit_state(uc);
         return UC_ERR_ARG;
     }
@@ -1865,7 +1865,7 @@ uc_err uc_mem_unmap(struct uc_struct *uc, uint64_t address, uint64_t size)
         return UC_ERR_NOMEM;
     }
 
-    if (uc->snapshot_level > 0) {
+    if (uc->unicorn.snapshot_level > 0) {
         uc_err res = uc_mem_unmap_snapshot(uc, address, size, NULL);
         restore_jit_state(uc);
         return res;
@@ -1946,21 +1946,21 @@ uc_err uc_hook_add(uc_engine *uc, uc_hook *hh, int type, void *callback,
             }
         }
 
-        if (uc->hook_insert) {
-            if (hook_insert(&uc->hook[UC_HOOK_INSN_IDX], hook) == NULL) {
+        if (uc->unicorn.hook_insert) {
+            if (hook_insert(&uc->unicorn.hook[UC_HOOK_INSN_IDX], hook) == NULL) {
                 free(hook);
                 restore_jit_state(uc);
                 return UC_ERR_NOMEM;
             }
         } else {
-            if (hook_append(&uc->hook[UC_HOOK_INSN_IDX], hook) == NULL) {
+            if (hook_append(&uc->unicorn.hook[UC_HOOK_INSN_IDX], hook) == NULL) {
                 free(hook);
                 restore_jit_state(uc);
                 return UC_ERR_NOMEM;
             }
         }
 
-        uc->hooks_count[UC_HOOK_INSN_IDX]++;
+        uc->unicorn.hooks_count[UC_HOOK_INSN_IDX]++;
         restore_jit_state(uc);
         return UC_ERR_OK;
     }
@@ -1981,21 +1981,21 @@ uc_err uc_hook_add(uc_engine *uc, uc_hook *hh, int type, void *callback,
             }
         }
 
-        if (uc->hook_insert) {
-            if (hook_insert(&uc->hook[UC_HOOK_TCG_OPCODE_IDX], hook) == NULL) {
+        if (uc->unicorn.hook_insert) {
+            if (hook_insert(&uc->unicorn.hook[UC_HOOK_TCG_OPCODE_IDX], hook) == NULL) {
                 free(hook);
                 restore_jit_state(uc);
                 return UC_ERR_NOMEM;
             }
         } else {
-            if (hook_append(&uc->hook[UC_HOOK_TCG_OPCODE_IDX], hook) == NULL) {
+            if (hook_append(&uc->unicorn.hook[UC_HOOK_TCG_OPCODE_IDX], hook) == NULL) {
                 free(hook);
                 restore_jit_state(uc);
                 return UC_ERR_NOMEM;
             }
         }
 
-        uc->hooks_count[UC_HOOK_TCG_OPCODE_IDX]++;
+        uc->unicorn.hooks_count[UC_HOOK_TCG_OPCODE_IDX]++;
         return UC_ERR_OK;
     }
 
@@ -2003,20 +2003,20 @@ uc_err uc_hook_add(uc_engine *uc, uc_hook *hh, int type, void *callback,
         if ((type >> i) & 1) {
             // TODO: invalid hook error?
             if (i < UC_HOOK_MAX) {
-                if (uc->hook_insert) {
-                    if (hook_insert(&uc->hook[i], hook) == NULL) {
+                if (uc->unicorn.hook_insert) {
+                    if (hook_insert(&uc->unicorn.hook[i], hook) == NULL) {
                         free(hook);
                         restore_jit_state(uc);
                         return UC_ERR_NOMEM;
                     }
                 } else {
-                    if (hook_append(&uc->hook[i], hook) == NULL) {
+                    if (hook_append(&uc->unicorn.hook[i], hook) == NULL) {
                         free(hook);
                         restore_jit_state(uc);
                         return UC_ERR_NOMEM;
                     }
                 }
-                uc->hooks_count[i]++;
+                uc->unicorn.hooks_count[i]++;
             }
         }
         i++;
@@ -2046,13 +2046,13 @@ uc_err uc_hook_del(uc_engine *uc, uc_hook hh)
     // an optimization would be to align the hook pointer
     // and store the type mask in the hook pointer.
     for (i = 0; i < UC_HOOK_MAX; i++) {
-        if (list_exists(&uc->hook[i], (void *)hook)) {
+        if (list_exists(&uc->unicorn.hook[i], (void *)hook)) {
             g_hash_table_foreach(hook->hooked_regions, hook_invalidate_region,
                                  uc);
             g_hash_table_remove_all(hook->hooked_regions);
             hook->to_delete = true;
-            uc->hooks_count[i]--;
-            hook_append(&uc->hooks_to_del, hook);
+            uc->unicorn.hooks_count[i]--;
+            hook_append(&uc->unicorn.hooks_to_del, hook);
         }
     }
 
@@ -2127,7 +2127,7 @@ void helper_uc_tracecode(int32_t size, uc_hook_idx index, void *handle,
         revert_uc_emu_stop(uc);
     }
 
-    for (cur = uc->hook[index].head;
+    for (cur = uc->unicorn.hook[index].head;
          cur != NULL && (hook = (struct hook *)cur->data); cur = cur->next) {
         if (hook->to_delete) {
             continue;
@@ -2136,7 +2136,7 @@ void helper_uc_tracecode(int32_t size, uc_hook_idx index, void *handle,
         // on invalid block/instruction, call instruction counter (if enable),
         // then quit
         if (size == 0) {
-            if (index == UC_HOOK_CODE_IDX && uc->count_hook) {
+            if (index == UC_HOOK_CODE_IDX && uc->unicorn.count_hook) {
                 // this is the instruction counter (first hook in the list)
                 JIT_CALLBACK_GUARD(((uc_cb_hookcode_t)hook->callback)(
                     uc, address, size, hook->user_data));
@@ -2172,7 +2172,7 @@ uc_err uc_mem_regions(uc_engine *uc, uc_mem_region **regions, uint32_t *count)
 
     UC_INIT(uc);
 
-    *count = uc->mapped_block_count;
+    *count = uc->unicorn.mapped_block_count;
 
     if (*count) {
         r = g_malloc0(*count * sizeof(uc_mem_region));
@@ -2184,9 +2184,9 @@ uc_err uc_mem_regions(uc_engine *uc, uc_mem_region **regions, uint32_t *count)
     }
 
     for (i = 0; i < *count; i++) {
-        r[i].begin = uc->mapped_blocks[i]->addr;
-        r[i].end = uc->mapped_blocks[i]->end - 1;
-        r[i].perms = uc->mapped_blocks[i]->perms;
+        r[i].begin = uc->unicorn.mapped_blocks[i]->addr;
+        r[i].end = uc->unicorn.mapped_blocks[i]->end - 1;
+        r[i].perms = uc->unicorn.mapped_blocks[i]->perms;
     }
 
     *regions = r;
@@ -2301,7 +2301,7 @@ uc_err uc_context_save(uc_engine *uc, uc_context *context)
         uc->tcg_flush_tlb(uc);
     }
 
-    context->snapshot_level = uc->snapshot_level;
+    context->snapshot_level = uc->unicorn.snapshot_level;
 
     if (uc->context_content & UC_CTL_CONTEXT_CPU) {
         if (!uc->context_save) {
@@ -2564,7 +2564,7 @@ uc_err uc_context_restore(uc_engine *uc, uc_context *context)
     uc_err ret;
 
     if (uc->context_content & UC_CTL_CONTEXT_MEMORY) {
-        uc->snapshot_level = context->snapshot_level;
+        uc->unicorn.snapshot_level = context->snapshot_level;
         if (!uc->flatview_copy(uc, uc->address_space_memory.current_map,
                                context->fv, true)) {
             return UC_ERR_NOMEM;
@@ -2989,10 +2989,10 @@ uc_err uc_ctl(uc_engine *uc, uc_control_type control, ...)
 
 static uc_err uc_snapshot(struct uc_struct *uc)
 {
-    if (uc->snapshot_level == INT32_MAX) {
+    if (uc->unicorn.snapshot_level == INT32_MAX) {
         return UC_ERR_RESOURCE;
     }
-    uc->snapshot_level++;
+    uc->unicorn.snapshot_level++;
     return UC_ERR_OK;
 }
 
@@ -3004,8 +3004,8 @@ static uc_err uc_restore_latest_snapshot(struct uc_struct *uc)
     QTAILQ_FOREACH_SAFE(subregion, &uc->system_memory->subregions,
                         subregions_link, subregion_next)
     {
-        uc->memory_filter_subregions(subregion, uc->snapshot_level);
-        if (subregion->priority >= uc->snapshot_level ||
+        uc->memory_filter_subregions(subregion, uc->unicorn.snapshot_level);
+        if (subregion->priority >= uc->unicorn.snapshot_level ||
             (!subregion->terminates && QTAILQ_EMPTY(&subregion->subregions))) {
             uc->memory_unmap(uc, subregion);
         }
@@ -3022,21 +3022,21 @@ static uc_err uc_restore_latest_snapshot(struct uc_struct *uc)
         level = (intptr_t)mr->container;
         mr->container = NULL;
 
-        if (level < uc->snapshot_level) {
+        if (level < uc->unicorn.snapshot_level) {
             break;
         }
         if (memory_overlap(uc, mr->addr, int128_get64(mr->size))) {
             return UC_ERR_MAP;
         }
         uc->memory_movein(uc, mr);
-        uc->memory_filter_subregions(mr, uc->snapshot_level);
+        uc->memory_filter_subregions(mr, uc->unicorn.snapshot_level);
         if (initial_mr != mr && QTAILQ_EMPTY(&mr->subregions)) {
             uc->memory_unmap(uc, subregion);
         }
         mem_map(uc, initial_mr);
         g_array_remove_range(uc->unmapped_regions, i, 1);
     }
-    uc->snapshot_level--;
+    uc->unicorn.snapshot_level--;
 
     return UC_ERR_OK;
 }

@@ -53,7 +53,7 @@ MemoryRegion *memory_map(struct uc_struct *uc, hwaddr begin, size_t size, uint32
         return NULL;
     }
 
-    memory_region_add_subregion_overlap(uc->system_memory, begin, ram, uc->snapshot_level);
+    memory_region_add_subregion_overlap(uc->system_memory, begin, ram, uc->unicorn.snapshot_level);
 
     if (uc->cpu) {
         tlb_flush(uc->cpu);
@@ -117,7 +117,7 @@ MemoryRegion *memory_cow(struct uc_struct *uc, MemoryRegion *current, hwaddr beg
     }
 
     memcpy(ramblock_ptr(ram->ram_block, 0), ramblock_ptr(current->ram_block, current_offset), size);
-    memory_region_add_subregion_overlap(current->container, offset, ram, uc->snapshot_level);
+    memory_region_add_subregion_overlap(current->container, offset, ram, uc->unicorn.snapshot_level);
 
     if (uc->cpu) {
         for (addr = ram->addr; (int64_t)(ram->end - addr) > 0; addr += uc->target_page_size) {
@@ -229,11 +229,11 @@ void memory_region_filter_subregions(MemoryRegion *mr, int32_t level)
 static void memory_region_remove_mapped_block(struct uc_struct *uc, MemoryRegion *mr, bool free)
 {
     size_t i;
-    for (i = 0; i < uc->mapped_block_count; i++) {
-        if (uc->mapped_blocks[i] == mr) {
-            uc->mapped_block_count--;
+    for (i = 0; i < uc->unicorn.mapped_block_count; i++) {
+        if (uc->unicorn.mapped_blocks[i] == mr) {
+            uc->unicorn.mapped_block_count--;
             //shift remainder of array down over deleted pointer
-            memmove(&uc->mapped_blocks[i], &uc->mapped_blocks[i + 1], sizeof(MemoryRegion*) * (uc->mapped_block_count - i));
+            memmove(&uc->unicorn.mapped_blocks[i], &uc->unicorn.mapped_blocks[i + 1], sizeof(MemoryRegion*) * (uc->unicorn.mapped_block_count - i));
             if (free) {
                 mr->destructor(mr);
                 g_free(mr);
@@ -276,7 +276,7 @@ void memory_moveout(struct uc_struct *uc, MemoryRegion *mr)
     uc->memory_region_update_pending = true;
     memory_region_transaction_commit(uc->system_memory);
     /* dirty hack to save the snapshot level */
-    mr->container = (void *)(intptr_t)uc->snapshot_level;
+    mr->container = (void *)(intptr_t)uc->unicorn.snapshot_level;
 }
 
 void memory_movein(struct uc_struct *uc, MemoryRegion *mr)
