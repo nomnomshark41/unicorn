@@ -1168,6 +1168,7 @@ endif()
 
 set(UNICORN_SRCS
     uc.c
+    uc_adapter.c
 
     qemu/softmmu/vl.c
 

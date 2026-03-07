@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include "uc_priv.h"
+#include "unicorn/uc_adapter.h"
 
 // target specific headers
 #include "qemu/target/m68k/unicorn.h"
@@ -32,8 +33,6 @@
 #include "qemu-common.h"
 
 static void clear_deleted_hooks(uc_engine *uc);
-static uc_err uc_snapshot(uc_engine *uc);
-static uc_err uc_restore_latest_snapshot(uc_engine *uc);
 
 #if defined(__APPLE__) && defined(HAVE_PTHREAD_JIT_PROTECT) &&                 \
     (defined(__arm__) || defined(__aarch64__))
@@ -72,32 +71,6 @@ static void restore_jit_state(uc_engine *uc)
     (void)uc;
 }
 #endif
-
-static void *hook_insert(struct list *l, struct hook *h)
-{
-    void *item = list_insert(l, (void *)h);
-    if (item) {
-        h->refs++;
-    }
-    return item;
-}
-
-static void *hook_append(struct list *l, struct hook *h)
-{
-    void *item = list_append(l, (void *)h);
-    if (item) {
-        h->refs++;
-    }
-    return item;
-}
-
-static void hook_invalidate_region(void *key, void *data, void *opaq)
-{
-    uc_engine *uc = (uc_engine *)opaq;
-    HookedRegion *region = (HookedRegion *)key;
-
-    uc->uc_invalidate_tb(uc, region->start, region->length);
-}
 
 static void hook_delete(void *data)
 {
@@ -746,267 +719,57 @@ uc_err uc_reg_write2(uc_engine *uc, int regid, const void *value, size_t *size)
     return UC_ERR_OK;
 }
 
-static uint64_t memory_region_len(uc_engine *uc, MemoryRegion *mr,
-                                  uint64_t address, uint64_t count)
-{
-    hwaddr end = mr->end;
-    while (mr->container != uc->system_memory) {
-        mr = mr->container;
-        end += mr->addr;
-    }
-    return (uint64_t)MIN(count, end - address);
-}
-
-// check if a memory area is mapped
-// this is complicated because an area can overlap adjacent blocks
-static bool check_mem_area(uc_engine *uc, uint64_t address, size_t size)
-{
-    size_t count = 0, len;
-
-    while (count < size) {
-        MemoryRegion *mr = uc->memory_mapping(uc, address);
-        if (mr) {
-            len = memory_region_len(uc, mr, address, size - count);
-            count += len;
-            address += len;
-        } else { // this address is not mapped in yet
-            break;
-        }
-    }
-
-    return (count == size);
-}
-
 uc_err uc_vmem_translate(uc_engine *uc, uint64_t address, uc_prot prot,
                               uint64_t *paddress)
 {
+    uc_err ret;
     UC_INIT(uc);
-
-    if (!(UC_PROT_READ == prot || UC_PROT_WRITE == prot ||
-          UC_PROT_EXEC == prot)) {
-        restore_jit_state(uc);
-        return UC_ERR_ARG;
-    }
-
-    // The sparc mmu doesn't support probe mode
-    if (uc->arch == UC_ARCH_SPARC && uc->cpu->cc->tlb_fill == uc->cpu->cc->tlb_fill_cpu) {
-        restore_jit_state(uc);
-        return UC_ERR_ARG;
-    }
-
-    if (!uc->virtual_to_physical(uc, address, prot, paddress)) {
-        restore_jit_state(uc);
-        switch (prot) {
-        case UC_PROT_READ:
-            return UC_ERR_READ_PROT;
-        case UC_PROT_WRITE:
-            return UC_ERR_WRITE_PROT;
-        case UC_PROT_EXEC:
-            return UC_ERR_FETCH_PROT;
-        default:
-            return UC_ERR_ARG;
-        }
-    }
-
+    ret = uca_vmem_translate(uc, address, prot, paddress);
     restore_jit_state(uc);
-    return UC_ERR_OK;
+    return ret;
 }
 
 UNICORN_EXPORT
 uc_err uc_vmem_read(uc_engine *uc, uint64_t address, uc_prot prot,
                            void *_bytes, size_t size)
 {
-    size_t count = 0, len;
-    uint8_t *bytes = _bytes;
-    uint64_t align;
-    uint64_t pagesize;
-
+    uc_err ret;
     UC_INIT(uc);
-
-    // qemu cpu_physical_memory_rw() size is an int
-    if (size > INT_MAX) {
-        restore_jit_state(uc);
-        return UC_ERR_ARG;
-    }
-
-    // The sparc mmu doesn't support probe mode
-    if (uc->arch == UC_ARCH_SPARC && uc->cpu->cc->tlb_fill == uc->cpu->cc->tlb_fill_cpu) {
-        restore_jit_state(uc);
-        return UC_ERR_ARG;
-    }
-
-    if (!(UC_PROT_READ == prot || UC_PROT_WRITE == prot ||
-          UC_PROT_EXEC == prot)) {
-        restore_jit_state(uc);
-        return UC_ERR_ARG;
-    }
-
-    while (count < size) {
-        align = uc->target_page_align;
-        pagesize = uc->target_page_size;
-        len = MIN(size - count, (address & ~align) + pagesize - address);
-        if (!uc->read_mem_virtual(uc, address, prot, bytes, len)) {
-            restore_jit_state(uc);
-            return UC_ERR_READ_PROT;
-        }
-        bytes += len;
-        address += len;
-        count += len;
-    }
-    assert(count == size);
+    ret = uca_vmem_read(uc, address, prot, _bytes, size);
     restore_jit_state(uc);
-    return UC_ERR_OK;
+    return ret;
 }
 
 UNICORN_EXPORT
 uc_err uc_vmem_write(uc_engine *uc, uint64_t address, uc_prot prot,
                            void *_bytes, size_t size)
 {
-    size_t count = 0, len;
-    uint8_t *bytes = _bytes;
-    uint64_t align;
-    uint64_t pagesize;
-    uint64_t paddr = 0;
-
+    uc_err ret;
     UC_INIT(uc);
-
-    // qemu cpu_physical_memory_rw() size is an int
-    if (size > INT_MAX) {
-        restore_jit_state(uc);
-        return UC_ERR_ARG;
-    }
-
-    // The sparc mmu doesn't support probe mode
-    if (uc->arch == UC_ARCH_SPARC && uc->cpu->cc->tlb_fill == uc->cpu->cc->tlb_fill_cpu) {
-        restore_jit_state(uc);
-        return UC_ERR_ARG;
-    }
-
-    if (!(UC_PROT_READ == prot || UC_PROT_WRITE == prot ||
-          UC_PROT_EXEC == prot)) {
-        restore_jit_state(uc);
-        return UC_ERR_ARG;
-    }
-
-    while (count < size) {
-        align = uc->target_page_align;
-        pagesize = uc->target_page_size;
-        len = MIN(size - count, (address & ~align) + pagesize - address);
-	if (uc_vmem_translate(uc, address, prot, &paddr) != UC_ERR_OK) {
-            restore_jit_state(uc);
-            return UC_ERR_WRITE_PROT;
-	}
-        if (uc_mem_write(uc, paddr, bytes, len) != UC_ERR_OK) {
-            restore_jit_state(uc);
-            return UC_ERR_WRITE_PROT;
-        }
-        bytes += len;
-        address += len;
-        count += len;
-    }
-    assert(count == size);
+    ret = uca_vmem_write(uc, address, prot, _bytes, size);
     restore_jit_state(uc);
-    return UC_ERR_OK;
+    return ret;
 }
 
 UNICORN_EXPORT
 uc_err uc_mem_read(uc_engine *uc, uint64_t address, void *_bytes, uint64_t size)
 {
-    uint64_t count = 0, len;
-    uint8_t *bytes = _bytes;
-
+    uc_err res;
     UC_INIT(uc);
-
-    if (!check_mem_area(uc, address, size)) {
-        restore_jit_state(uc);
-        return UC_ERR_READ_UNMAPPED;
-    }
-
-    // memory area can overlap adjacent memory blocks
-    while (count < size) {
-        MemoryRegion *mr = uc->memory_mapping(uc, address);
-        if (mr) {
-            len = memory_region_len(uc, mr, address, size - count);
-            if (uc->read_mem(&uc->address_space_memory, address, bytes, len) ==
-                false) {
-                break;
-            }
-            count += len;
-            address += len;
-            bytes += len;
-        } else { // this address is not mapped in yet
-            break;
-        }
-    }
-
-    if (count == size) {
-        restore_jit_state(uc);
-        return UC_ERR_OK;
-    } else {
-        restore_jit_state(uc);
-        return UC_ERR_READ_UNMAPPED;
-    }
+    res = uca_mem_read(uc, address, _bytes, size);
+    restore_jit_state(uc);
+    return res;
 }
 
 UNICORN_EXPORT
 uc_err uc_mem_write(uc_engine *uc, uint64_t address, const void *_bytes,
                     uint64_t size)
 {
-    uint64_t count = 0, len;
-    const uint8_t *bytes = _bytes;
-
+    uc_err res;
     UC_INIT(uc);
-
-    if (!check_mem_area(uc, address, size)) {
-        restore_jit_state(uc);
-        return UC_ERR_WRITE_UNMAPPED;
-    }
-
-    // memory area can overlap adjacent memory blocks
-    while (count < size) {
-        MemoryRegion *mr = uc->memory_mapping(uc, address);
-        if (mr) {
-            uint32_t operms = mr->perms;
-            uint64_t align = uc->target_page_align;
-            if (!(operms & UC_PROT_WRITE)) { // write protected
-                // but this is not the program accessing memory, so temporarily
-                // mark writable
-                uc->readonly_mem(mr, false);
-            }
-
-            len = memory_region_len(uc, mr, address, size - count);
-            if (uc->unicorn.snapshot_level && uc->unicorn.snapshot_level > mr->priority) {
-                mr = uc->memory_cow(uc, mr, address & ~align,
-                                    (len + (address & align) + align) & ~align);
-                if (!mr) {
-                    return UC_ERR_NOMEM;
-                }
-            }
-            if (uc->write_mem(&uc->address_space_memory, address, bytes, len) ==
-                false) {
-                break;
-            }
-
-            if (!(operms & UC_PROT_WRITE)) { // write protected
-                // now write protect it again
-                uc->readonly_mem(mr, true);
-            }
-
-            count += len;
-            address += len;
-            bytes += len;
-        } else { // this address is not mapped in yet
-            break;
-        }
-    }
-
-    if (count == size) {
-        restore_jit_state(uc);
-        return UC_ERR_OK;
-    } else {
-        restore_jit_state(uc);
-        return UC_ERR_WRITE_UNMAPPED;
-    }
+    res = uca_mem_write(uc, address, _bytes, size);
+    restore_jit_state(uc);
+    return res;
 }
 
 #define TIMEOUT_STEP 2 // microseconds
@@ -1263,144 +1026,13 @@ uc_err uc_emu_stop(uc_engine *uc)
     return err;
 }
 
-// return target index where a memory region at the address exists, or could be
-// inserted
-//
-// address either is inside the mapping at the returned index, or is in free
-// space before the next mapping.
-//
-// if there is overlap, between regions, ending address will be higher than the
-// starting address of the mapping at returned index
-static int bsearch_mapped_blocks(const uc_engine *uc, uint64_t address)
-{
-    int left, right, mid;
-    MemoryRegion *mapping;
-
-    left = 0;
-    right = uc->unicorn.mapped_block_count;
-
-    while (left < right) {
-        mid = left + (right - left) / 2;
-
-        mapping = uc->unicorn.mapped_blocks[mid];
-
-        if (mapping->end - 1 < address) {
-            left = mid + 1;
-        } else if (mapping->addr > address) {
-            right = mid;
-        } else {
-            return mid;
-        }
-    }
-
-    return left;
-}
-
-// find if a memory range overlaps with existing mapped regions
-static bool memory_overlap(struct uc_struct *uc, uint64_t begin, size_t size)
-{
-    unsigned int i;
-    uint64_t end = begin + size - 1;
-
-    i = bsearch_mapped_blocks(uc, begin);
-
-    // is this the highest region with no possible overlap?
-    if (i >= uc->unicorn.mapped_block_count)
-        return false;
-
-    // end address overlaps this region?
-    if (end >= uc->unicorn.mapped_blocks[i]->addr)
-        return true;
-
-    // not found
-
-    return false;
-}
-
-// common setup/error checking shared between uc_mem_map and uc_mem_map_ptr
-static uc_err mem_map(uc_engine *uc, MemoryRegion *block)
-{
-
-    MemoryRegion **regions;
-    int pos;
-
-    if (block == NULL) {
-        return UC_ERR_NOMEM;
-    }
-
-    if ((uc->unicorn.mapped_block_count & (MEM_BLOCK_INCR - 1)) == 0) { // time to grow
-        regions = (MemoryRegion **)g_realloc(
-            uc->unicorn.mapped_blocks,
-            sizeof(MemoryRegion *) * (uc->unicorn.mapped_block_count + MEM_BLOCK_INCR));
-        if (regions == NULL) {
-            return UC_ERR_NOMEM;
-        }
-        uc->unicorn.mapped_blocks = regions;
-    }
-
-    pos = bsearch_mapped_blocks(uc, block->addr);
-
-    // shift the array right to give space for the new pointer
-    memmove(&uc->unicorn.mapped_blocks[pos + 1], &uc->unicorn.mapped_blocks[pos],
-            sizeof(MemoryRegion *) * (uc->unicorn.mapped_block_count - pos));
-
-    uc->unicorn.mapped_blocks[pos] = block;
-    uc->unicorn.mapped_block_count++;
-
-    return UC_ERR_OK;
-}
-
-static uc_err mem_map_check(uc_engine *uc, uint64_t address, uint64_t size,
-                            uint32_t perms)
-{
-    if (size == 0) {
-        // invalid memory mapping
-        return UC_ERR_ARG;
-    }
-
-    // address cannot wrap around
-    if (address + size - 1 < address) {
-        return UC_ERR_ARG;
-    }
-
-    // address must be aligned to uc->target_page_size
-    if ((address & uc->target_page_align) != 0) {
-        return UC_ERR_ARG;
-    }
-
-    // size must be multiple of uc->target_page_size
-    if ((size & uc->target_page_align) != 0) {
-        return UC_ERR_ARG;
-    }
-
-    // check for only valid permissions
-    if ((perms & ~UC_PROT_ALL) != 0) {
-        return UC_ERR_ARG;
-    }
-
-    // this area overlaps existing mapped regions?
-    if (memory_overlap(uc, address, size)) {
-        return UC_ERR_MAP;
-    }
-
-    return UC_ERR_OK;
-}
-
 UNICORN_EXPORT
 uc_err uc_mem_map(uc_engine *uc, uint64_t address, uint64_t size,
                   uint32_t perms)
 {
     uc_err res;
-
     UC_INIT(uc);
-
-    res = mem_map_check(uc, address, size, perms);
-    if (res) {
-        restore_jit_state(uc);
-        return res;
-    }
-
-    res = mem_map(uc, uc->memory_map(uc, address, size, perms));
+    res = uca_mem_map(uc, address, size, perms);
     restore_jit_state(uc);
     return res;
 }
@@ -1410,21 +1042,8 @@ uc_err uc_mem_map_ptr(uc_engine *uc, uint64_t address, uint64_t size,
                       uint32_t perms, void *ptr)
 {
     uc_err res;
-
     UC_INIT(uc);
-
-    if (ptr == NULL) {
-        restore_jit_state(uc);
-        return UC_ERR_ARG;
-    }
-
-    res = mem_map_check(uc, address, size, perms);
-    if (res) {
-        restore_jit_state(uc);
-        return res;
-    }
-
-    res = mem_map(uc, uc->memory_map_ptr(uc, address, size, perms, ptr));
+    res = uca_mem_map_ptr(uc, address, size, perms, ptr);
     restore_jit_state(uc);
     return res;
 }
@@ -1435,597 +1054,58 @@ uc_err uc_mmio_map(uc_engine *uc, uint64_t address, uint64_t size,
                    uc_cb_mmio_write_t write_cb, void *user_data_write)
 {
     uc_err res;
-
     UC_INIT(uc);
-
-    res = mem_map_check(uc, address, size, UC_PROT_ALL);
-    if (res) {
-        restore_jit_state(uc);
-        return res;
-    }
-
-    // The callbacks do not need to be checked for NULL here, as their presence
-    // (or lack thereof) will determine the permissions used.
-    res = mem_map(uc, uc->memory_map_io(uc, address, size, read_cb, write_cb,
-                                        user_data_read, user_data_write));
+    res = uca_mmio_map(uc, address, size, read_cb, user_data_read,
+                       write_cb, user_data_write);
     restore_jit_state(uc);
     return res;
-}
-
-// Create a backup copy of the indicated MemoryRegion.
-// Generally used in prepartion for splitting a MemoryRegion.
-static uint8_t *copy_region(struct uc_struct *uc, MemoryRegion *mr)
-{
-    uint8_t *block = (uint8_t *)g_malloc0((uint64_t)int128_get64(mr->size));
-    if (block != NULL) {
-        uc_err err =
-            uc_mem_read(uc, mr->addr, block, (uint64_t)int128_get64(mr->size));
-        if (err != UC_ERR_OK) {
-            free(block);
-            block = NULL;
-        }
-    }
-
-    return block;
-}
-
-/*
-    This function is similar to split_region, but for MMIO memory.
-
-    Note this function may be called recursively.
-*/
-static bool split_mmio_region(struct uc_struct *uc, MemoryRegion *mr,
-                              uint64_t address, uint64_t size, bool do_delete)
-{
-    uint64_t begin, end, chunk_end;
-    uint64_t l_size, r_size, m_size;
-    mmio_cbs backup;
-
-    chunk_end = address + size;
-
-    // This branch also break recursion.
-    if (address <= mr->addr && chunk_end >= mr->end) {
-        return true;
-    }
-
-    if (size == 0) {
-        return false;
-    }
-
-    begin = mr->addr;
-    end = mr->end;
-
-    memcpy(&backup, mr->opaque, sizeof(mmio_cbs));
-
-    /* overlapping cases
-     *               |------mr------|
-     * case 1    |---size--|            // Is it possible???
-     * case 2           |--size--|
-     * case 3                  |---size--|
-     */
-
-    // unmap this region first, then do split it later
-    if (uc_mem_unmap(uc, mr->addr, (uint64_t)int128_get64(mr->size)) !=
-        UC_ERR_OK) {
-        return false;
-    }
-
-    // adjust some things
-    if (address < begin) {
-        address = begin;
-    }
-    if (chunk_end > end) {
-        chunk_end = end;
-    }
-
-    // compute sub region sizes
-    l_size = (uint64_t)(address - begin);
-    r_size = (uint64_t)(end - chunk_end);
-    m_size = (uint64_t)(chunk_end - address);
-
-    if (l_size > 0) {
-        if (uc_mmio_map(uc, begin, l_size, backup.read, backup.user_data_read,
-                        backup.write, backup.user_data_write) != UC_ERR_OK) {
-            return false;
-        }
-    }
-
-    if (m_size > 0 && !do_delete) {
-        if (uc_mmio_map(uc, address, m_size, backup.read, backup.user_data_read,
-                        backup.write, backup.user_data_write) != UC_ERR_OK) {
-            return false;
-        }
-    }
-
-    if (r_size > 0) {
-        if (uc_mmio_map(uc, chunk_end, r_size, backup.read,
-                        backup.user_data_read, backup.write,
-                        backup.user_data_write) != UC_ERR_OK) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-/*
-   Split the given MemoryRegion at the indicated address for the indicated size
-   this may result in the create of up to 3 spanning sections. If the delete
-   parameter is true, the no new section will be created to replace the indicate
-   range. This functions exists to support uc_mem_protect and uc_mem_unmap.
-
-   This is a static function and callers have already done some preliminary
-   parameter validation.
-
-   The do_delete argument indicates that we are being called to support
-   uc_mem_unmap. In this case we save some time by choosing NOT to remap
-   the areas that are intended to get unmapped
- */
-// TODO: investigate whether qemu region manipulation functions already offered
-// this capability
-static bool split_region(struct uc_struct *uc, MemoryRegion *mr,
-                         uint64_t address, uint64_t size, bool do_delete)
-{
-    uint8_t *backup;
-    uint32_t perms;
-    uint64_t begin, end, chunk_end;
-    uint64_t l_size, m_size, r_size;
-    RAMBlock *block = NULL;
-    bool prealloc = false;
-
-    chunk_end = address + size;
-
-    // if this region belongs to area [address, address+size],
-    // then there is no work to do.
-    if (address <= mr->addr && chunk_end >= mr->end) {
-        return true;
-    }
-
-    if (size == 0) {
-        // trivial case
-        return true;
-    }
-
-    if (address >= mr->end || chunk_end <= mr->addr) {
-        // impossible case
-        return false;
-    }
-
-    // Find the correct and large enough (which contains our target mr)
-    // to create the content backup.
-    block = mr->ram_block;
-
-    if (block == NULL) {
-        return false;
-    }
-
-    // RAM_PREALLOC is not defined outside exec.c and I didn't feel like
-    // moving it
-    prealloc = !!(block->flags & 1);
-
-    if (block->flags & 1) {
-        backup = block->host;
-    } else {
-        backup = copy_region(uc, mr);
-        if (backup == NULL) {
-            return false;
-        }
-    }
-
-    // save the essential information required for the split before mr gets
-    // deleted
-    perms = mr->perms;
-    begin = mr->addr;
-    end = mr->end;
-
-    // unmap this region first, then do split it later
-    if (uc_mem_unmap(uc, mr->addr, (uint64_t)int128_get64(mr->size)) !=
-        UC_ERR_OK) {
-        goto error;
-    }
-
-    /* overlapping cases
-     *               |------mr------|
-     * case 1    |---size--|
-     * case 2           |--size--|
-     * case 3                  |---size--|
-     */
-
-    // adjust some things
-    if (address < begin) {
-        address = begin;
-    }
-    if (chunk_end > end) {
-        chunk_end = end;
-    }
-
-    // compute sub region sizes
-    l_size = (uint64_t)(address - begin);
-    r_size = (uint64_t)(end - chunk_end);
-    m_size = (uint64_t)(chunk_end - address);
-
-    // If there are error in any of the below operations, things are too far
-    // gone at that point to recover. Could try to remap orignal region, but
-    // these smaller allocation just failed so no guarantee that we can recover
-    // the original allocation at this point
-    if (l_size > 0) {
-        if (!prealloc) {
-            if (uc_mem_map(uc, begin, l_size, perms) != UC_ERR_OK) {
-                goto error;
-            }
-            if (uc_mem_write(uc, begin, backup, l_size) != UC_ERR_OK) {
-                goto error;
-            }
-        } else {
-            if (uc_mem_map_ptr(uc, begin, l_size, perms, backup) != UC_ERR_OK) {
-                goto error;
-            }
-        }
-    }
-
-    if (m_size > 0 && !do_delete) {
-        if (!prealloc) {
-            if (uc_mem_map(uc, address, m_size, perms) != UC_ERR_OK) {
-                goto error;
-            }
-            if (uc_mem_write(uc, address, backup + l_size, m_size) !=
-                UC_ERR_OK) {
-                goto error;
-            }
-        } else {
-            if (uc_mem_map_ptr(uc, address, m_size, perms, backup + l_size) !=
-                UC_ERR_OK) {
-                goto error;
-            }
-        }
-    }
-
-    if (r_size > 0) {
-        if (!prealloc) {
-            if (uc_mem_map(uc, chunk_end, r_size, perms) != UC_ERR_OK) {
-                goto error;
-            }
-            if (uc_mem_write(uc, chunk_end, backup + l_size + m_size, r_size) !=
-                UC_ERR_OK) {
-                goto error;
-            }
-        } else {
-            if (uc_mem_map_ptr(uc, chunk_end, r_size, perms,
-                               backup + l_size + m_size) != UC_ERR_OK) {
-                goto error;
-            }
-        }
-    }
-
-    if (!prealloc) {
-        free(backup);
-    }
-    return true;
-
-error:
-    if (!prealloc) {
-        free(backup);
-    }
-    return false;
 }
 
 UNICORN_EXPORT
 uc_err uc_mem_protect(struct uc_struct *uc, uint64_t address, uint64_t size,
                       uint32_t perms)
 {
-    MemoryRegion *mr;
-    uint64_t addr = address;
-    uint64_t pc;
-    uint64_t count, len;
-    bool remove_exec = false;
-
+    uc_err res;
     UC_INIT(uc);
-
-    // snapshot and protection can't be mixed
-    if (uc->unicorn.snapshot_level > 0) {
-        restore_jit_state(uc);
-        return UC_ERR_ARG;
-    }
-
-    if (size == 0) {
-        // trivial case, no change
-        restore_jit_state(uc);
-        return UC_ERR_OK;
-    }
-
-    // address must be aligned to uc->target_page_size
-    if ((address & uc->target_page_align) != 0) {
-        restore_jit_state(uc);
-        return UC_ERR_ARG;
-    }
-
-    // size must be multiple of uc->target_page_size
-    if ((size & uc->target_page_align) != 0) {
-        restore_jit_state(uc);
-        return UC_ERR_ARG;
-    }
-
-    // check for only valid permissions
-    if ((perms & ~UC_PROT_ALL) != 0) {
-        restore_jit_state(uc);
-        return UC_ERR_ARG;
-    }
-
-    // check that user's entire requested block is mapped
-    // TODO check if protected is possible
-    // deny after cow
-    if (!check_mem_area(uc, address, size)) {
-        restore_jit_state(uc);
-        return UC_ERR_NOMEM;
-    }
-
-    // Now we know entire region is mapped, so change permissions
-    // We may need to split regions if this area spans adjacent regions
-    addr = address;
-    count = 0;
-    while (count < size) {
-        mr = uc->memory_mapping(uc, addr);
-        len = memory_region_len(uc, mr, addr, size - count);
-        if (mr->ram) {
-            if (!split_region(uc, mr, addr, len, false)) {
-                restore_jit_state(uc);
-                return UC_ERR_NOMEM;
-            }
-
-            mr = uc->memory_mapping(uc, addr);
-            // will this remove EXEC permission?
-            if (((mr->perms & UC_PROT_EXEC) != 0) &&
-                ((perms & UC_PROT_EXEC) == 0)) {
-                remove_exec = true;
-            }
-            mr->perms = perms;
-            uc->readonly_mem(mr, (perms & UC_PROT_WRITE) == 0);
-
-        } else {
-            if (!split_mmio_region(uc, mr, addr, len, false)) {
-                restore_jit_state(uc);
-                return UC_ERR_NOMEM;
-            }
-
-            mr = uc->memory_mapping(uc, addr);
-            mr->perms = perms;
-        }
-
-        count += len;
-        addr += len;
-    }
-
-    // if EXEC permission is removed, then quit TB and continue at the same
-    // place
-    if (remove_exec) {
-        pc = uc->get_pc(uc);
-        if (pc < address + size && pc >= address) {
-            uc->quit_request = true;
-            uc_emu_stop(uc);
-        }
-    }
-
+    res = uca_mem_protect(uc, address, size, perms);
     restore_jit_state(uc);
-    return UC_ERR_OK;
-}
-
-static uc_err uc_mem_unmap_snapshot(struct uc_struct *uc, uint64_t address,
-                                    uint64_t size, MemoryRegion **ret)
-{
-    MemoryRegion *mr;
-
-    mr = uc->memory_mapping(uc, address);
-    while (mr->container != uc->system_memory) {
-        mr = mr->container;
-    }
-
-    if (mr->addr != address || int128_get64(mr->size) != size) {
-        return UC_ERR_ARG;
-    }
-
-    if (ret) {
-        *ret = mr;
-    }
-
-    uc->memory_moveout(uc, mr);
-
-    return UC_ERR_OK;
+    return res;
 }
 
 UNICORN_EXPORT
 uc_err uc_mem_unmap(struct uc_struct *uc, uint64_t address, uint64_t size)
 {
-    MemoryRegion *mr;
-    uint64_t addr;
-    uint64_t count, len;
-
+    uc_err res;
     UC_INIT(uc);
-
-    if (size == 0) {
-        // nothing to unmap
-        restore_jit_state(uc);
-        return UC_ERR_OK;
-    }
-
-    // address must be aligned to uc->target_page_size
-    if ((address & uc->target_page_align) != 0) {
-        restore_jit_state(uc);
-        return UC_ERR_ARG;
-    }
-
-    // size must be multiple of uc->target_page_size
-    if ((size & uc->target_page_align) != 0) {
-        restore_jit_state(uc);
-        return UC_ERR_ARG;
-    }
-
-    // check that user's entire requested block is mapped
-    if (!check_mem_area(uc, address, size)) {
-        restore_jit_state(uc);
-        return UC_ERR_NOMEM;
-    }
-
-    if (uc->unicorn.snapshot_level > 0) {
-        uc_err res = uc_mem_unmap_snapshot(uc, address, size, NULL);
-        restore_jit_state(uc);
-        return res;
-    }
-
-    // Now we know entire region is mapped, so do the unmap
-    // We may need to split regions if this area spans adjacent regions
-    addr = address;
-    count = 0;
-    while (count < size) {
-        mr = uc->memory_mapping(uc, addr);
-        len = memory_region_len(uc, mr, addr, size - count);
-        if (!mr->ram) {
-            if (!split_mmio_region(uc, mr, addr, len, true)) {
-                restore_jit_state(uc);
-                return UC_ERR_NOMEM;
-            }
-        } else {
-            if (!split_region(uc, mr, addr, len, true)) {
-                restore_jit_state(uc);
-                return UC_ERR_NOMEM;
-            }
-        }
-
-        // if we can retrieve the mapping, then no splitting took place
-        // so unmap here
-        mr = uc->memory_mapping(uc, addr);
-        if (mr != NULL) {
-            uc->memory_unmap(uc, mr);
-        }
-        count += len;
-        addr += len;
-    }
-
+    res = uca_mem_unmap(uc, address, size);
     restore_jit_state(uc);
-    return UC_ERR_OK;
+    return res;
 }
 
 UNICORN_EXPORT
 uc_err uc_hook_add(uc_engine *uc, uc_hook *hh, int type, void *callback,
                    void *user_data, uint64_t begin, uint64_t end, ...)
 {
-    int ret = UC_ERR_OK;
-    int i = 0;
-
+    uc_err ret;
     UC_INIT(uc);
 
-    struct hook *hook = calloc(1, sizeof(struct hook));
-    if (hook == NULL) {
-        restore_jit_state(uc);
-        return UC_ERR_NOMEM;
-    }
-
-    hook->begin = begin;
-    hook->end = end;
-    hook->type = type;
-    hook->callback = callback;
-    hook->user_data = user_data;
-    hook->refs = 0;
-    hook->to_delete = false;
-    hook->hooked_regions = g_hash_table_new_full(
-        hooked_regions_hash, hooked_regions_equal, g_free, NULL);
-    *hh = (uc_hook)hook;
-
-    // UC_HOOK_INSN has an extra argument for instruction ID
     if (type & UC_HOOK_INSN) {
-        va_list valist;
-
-        va_start(valist, end);
-        hook->insn = va_arg(valist, int);
-        va_end(valist);
-
-        if (uc->insn_hook_validate) {
-            if (!uc->insn_hook_validate(hook->insn)) {
-                free(hook);
-                restore_jit_state(uc);
-                return UC_ERR_HOOK;
-            }
-        }
-
-        if (uc->unicorn.hook_insert) {
-            if (hook_insert(&uc->unicorn.hook[UC_HOOK_INSN_IDX], hook) == NULL) {
-                free(hook);
-                restore_jit_state(uc);
-                return UC_ERR_NOMEM;
-            }
-        } else {
-            if (hook_append(&uc->unicorn.hook[UC_HOOK_INSN_IDX], hook) == NULL) {
-                free(hook);
-                restore_jit_state(uc);
-                return UC_ERR_NOMEM;
-            }
-        }
-
-        uc->unicorn.hooks_count[UC_HOOK_INSN_IDX]++;
-        restore_jit_state(uc);
-        return UC_ERR_OK;
-    }
-
-    if (type & UC_HOOK_TCG_OPCODE) {
-        va_list valist;
-
-        va_start(valist, end);
-        hook->op = va_arg(valist, int);
-        hook->op_flags = va_arg(valist, int);
-        va_end(valist);
-
-        if (uc->opcode_hook_invalidate) {
-            if (!uc->opcode_hook_invalidate(hook->op, hook->op_flags)) {
-                free(hook);
-                restore_jit_state(uc);
-                return UC_ERR_HOOK;
-            }
-        }
-
-        if (uc->unicorn.hook_insert) {
-            if (hook_insert(&uc->unicorn.hook[UC_HOOK_TCG_OPCODE_IDX], hook) == NULL) {
-                free(hook);
-                restore_jit_state(uc);
-                return UC_ERR_NOMEM;
-            }
-        } else {
-            if (hook_append(&uc->unicorn.hook[UC_HOOK_TCG_OPCODE_IDX], hook) == NULL) {
-                free(hook);
-                restore_jit_state(uc);
-                return UC_ERR_NOMEM;
-            }
-        }
-
-        uc->unicorn.hooks_count[UC_HOOK_TCG_OPCODE_IDX]++;
-        return UC_ERR_OK;
-    }
-
-    while ((type >> i) > 0) {
-        if ((type >> i) & 1) {
-            // TODO: invalid hook error?
-            if (i < UC_HOOK_MAX) {
-                if (uc->unicorn.hook_insert) {
-                    if (hook_insert(&uc->unicorn.hook[i], hook) == NULL) {
-                        free(hook);
-                        restore_jit_state(uc);
-                        return UC_ERR_NOMEM;
-                    }
-                } else {
-                    if (hook_append(&uc->unicorn.hook[i], hook) == NULL) {
-                        free(hook);
-                        restore_jit_state(uc);
-                        return UC_ERR_NOMEM;
-                    }
-                }
-                uc->unicorn.hooks_count[i]++;
-            }
-        }
-        i++;
-    }
-
-    // we didn't use the hook
-    // TODO: return an error?
-    if (hook->refs == 0) {
-        free(hook);
+        va_list vl;
+        va_start(vl, end);
+        int insn_id = va_arg(vl, int);
+        va_end(vl);
+        ret = uca_hook_add_insn(uc, hh, callback, user_data, begin, end,
+                                insn_id);
+    } else if (type & UC_HOOK_TCG_OPCODE) {
+        va_list vl;
+        va_start(vl, end);
+        int op       = va_arg(vl, int);
+        int op_flags = va_arg(vl, int);
+        va_end(vl);
+        ret = uca_hook_add_tcg_opcode(uc, hh, callback, user_data, begin, end,
+                                      op, op_flags);
+    } else {
+        ret = uca_hook_add_type(uc, hh, type, callback, user_data, begin, end);
     }
 
     restore_jit_state(uc);
@@ -2035,29 +1115,10 @@ uc_err uc_hook_add(uc_engine *uc, uc_hook *hh, int type, void *callback,
 UNICORN_EXPORT
 uc_err uc_hook_del(uc_engine *uc, uc_hook hh)
 {
-    int i;
-    struct hook *hook = (struct hook *)hh;
-
     UC_INIT(uc);
-
-    // we can't dereference hook->type if hook is invalid
-    // so for now we need to iterate over all possible types to remove the hook
-    // which is less efficient
-    // an optimization would be to align the hook pointer
-    // and store the type mask in the hook pointer.
-    for (i = 0; i < UC_HOOK_MAX; i++) {
-        if (list_exists(&uc->unicorn.hook[i], (void *)hook)) {
-            g_hash_table_foreach(hook->hooked_regions, hook_invalidate_region,
-                                 uc);
-            g_hash_table_remove_all(hook->hooked_regions);
-            hook->to_delete = true;
-            uc->unicorn.hooks_count[i]--;
-            hook_append(&uc->unicorn.hooks_to_del, hook);
-        }
-    }
-
+    uc_err ret = uca_hook_del(uc, hh);
     restore_jit_state(uc);
-    return UC_ERR_OK;
+    return ret;
 }
 
 // TCG helper
@@ -2167,32 +1228,11 @@ void helper_uc_tracecode(int32_t size, uc_hook_idx index, void *handle,
 UNICORN_EXPORT
 uc_err uc_mem_regions(uc_engine *uc, uc_mem_region **regions, uint32_t *count)
 {
-    uint32_t i;
-    uc_mem_region *r = NULL;
-
+    uc_err ret;
     UC_INIT(uc);
-
-    *count = uc->unicorn.mapped_block_count;
-
-    if (*count) {
-        r = g_malloc0(*count * sizeof(uc_mem_region));
-        if (r == NULL) {
-            // out of memory
-            restore_jit_state(uc);
-            return UC_ERR_NOMEM;
-        }
-    }
-
-    for (i = 0; i < *count; i++) {
-        r[i].begin = uc->unicorn.mapped_blocks[i]->addr;
-        r[i].end = uc->unicorn.mapped_blocks[i]->end - 1;
-        r[i].perms = uc->unicorn.mapped_blocks[i]->perms;
-    }
-
-    *regions = r;
-
+    ret = uca_mem_regions(uc, regions, count);
     restore_jit_state(uc);
-    return UC_ERR_OK;
+    return ret;
 }
 
 UNICORN_EXPORT
@@ -2233,23 +1273,11 @@ uc_err uc_query(uc_engine *uc, uc_query_type type, size_t *result)
 UNICORN_EXPORT
 uc_err uc_context_alloc(uc_engine *uc, uc_context **context)
 {
-    struct uc_context **_context = context;
-    size_t size = uc_context_size(uc);
-
+    uc_err ret;
     UC_INIT(uc);
-
-    *_context = g_malloc(size);
-    if (*_context) {
-        (*_context)->context_size = size - sizeof(uc_context);
-        (*_context)->arch = uc->arch;
-        (*_context)->mode = uc->mode;
-        (*_context)->fv = NULL;
-        restore_jit_state(uc);
-        return UC_ERR_OK;
-    } else {
-        restore_jit_state(uc);
-        return UC_ERR_NOMEM;
-    }
+    ret = uca_context_alloc(uc, context);
+    restore_jit_state(uc);
+    return ret;
 }
 
 UNICORN_EXPORT
@@ -2262,58 +1290,18 @@ uc_err uc_free(void *mem)
 UNICORN_EXPORT
 size_t uc_context_size(uc_engine *uc)
 {
+    size_t s;
     UC_INIT(uc);
-
+    s = uca_context_size(uc);
     restore_jit_state(uc);
-    if (!uc->context_size) {
-        // return the total size of struct uc_context
-        return sizeof(uc_context) + uc->cpu_context_size;
-    } else {
-        return sizeof(uc_context) + uc->context_size(uc);
-    }
+    return s;
 }
 
 UNICORN_EXPORT
 uc_err uc_context_save(uc_engine *uc, uc_context *context)
 {
     UC_INIT(uc);
-    uc_err ret = UC_ERR_OK;
-
-    if (uc->context_content & UC_CTL_CONTEXT_MEMORY) {
-        if (!context->fv) {
-            context->fv = g_malloc0(sizeof(*context->fv));
-        }
-        if (!context->fv) {
-            return UC_ERR_NOMEM;
-        }
-        if (!uc->flatview_copy(uc, context->fv,
-                               uc->address_space_memory.current_map, false)) {
-            restore_jit_state(uc);
-            return UC_ERR_NOMEM;
-        }
-        ret = uc_snapshot(uc);
-        if (ret != UC_ERR_OK) {
-            restore_jit_state(uc);
-            return ret;
-        }
-        context->ramblock_freed = uc->ram_list.freed;
-        context->last_block = uc->ram_list.last_block;
-        uc->tcg_flush_tlb(uc);
-    }
-
-    context->snapshot_level = uc->unicorn.snapshot_level;
-
-    if (uc->context_content & UC_CTL_CONTEXT_CPU) {
-        if (!uc->context_save) {
-            memcpy(context->data, uc->cpu->env_ptr, context->context_size);
-            restore_jit_state(uc);
-            return UC_ERR_OK;
-        } else {
-            ret = uc->context_save(uc, context);
-            restore_jit_state(uc);
-            return ret;
-        }
-    }
+    uc_err ret = uca_context_save(uc, context);
     restore_jit_state(uc);
     return ret;
 }
@@ -2561,37 +1549,9 @@ UNICORN_EXPORT
 uc_err uc_context_restore(uc_engine *uc, uc_context *context)
 {
     UC_INIT(uc);
-    uc_err ret;
-
-    if (uc->context_content & UC_CTL_CONTEXT_MEMORY) {
-        uc->unicorn.snapshot_level = context->snapshot_level;
-        if (!uc->flatview_copy(uc, uc->address_space_memory.current_map,
-                               context->fv, true)) {
-            return UC_ERR_NOMEM;
-        }
-        ret = uc_restore_latest_snapshot(uc);
-        if (ret != UC_ERR_OK) {
-            restore_jit_state(uc);
-            return ret;
-        }
-        uc_snapshot(uc);
-        uc->ram_list.freed = context->ramblock_freed;
-        uc->ram_list.last_block = context->last_block;
-        uc->tcg_flush_tlb(uc);
-    }
-
-    if (uc->context_content & UC_CTL_CONTEXT_CPU) {
-        if (!uc->context_restore) {
-            memcpy(uc->cpu->env_ptr, context->data, context->context_size);
-            restore_jit_state(uc);
-            return UC_ERR_OK;
-        } else {
-            ret = uc->context_restore(uc, context);
-            restore_jit_state(uc);
-            return ret;
-        }
-    }
-    return UC_ERR_OK;
+    uc_err ret = uca_context_restore(uc, context);
+    restore_jit_state(uc);
+    return ret;
 }
 
 UNICORN_EXPORT
@@ -2876,7 +1836,7 @@ uc_err uc_ctl(uc_engine *uc, uc_control_type control, ...)
         if (rw == UC_CTL_IO_READ_WRITE) {
             uint64_t addr = va_arg(args, uint64_t);
             uc_tb *tb = va_arg(args, uc_tb *);
-            err = uc->uc_gen_tb(uc, addr, tb);
+            err = uca_tb_request(uc, addr, tb);
         } else {
             err = UC_ERR_ARG;
         }
@@ -2895,7 +1855,7 @@ uc_err uc_ctl(uc_engine *uc, uc_control_type control, ...)
             if (end <= addr) {
                 err = UC_ERR_ARG;
             } else {
-                uc->uc_invalidate_tb(uc, addr, end - addr);
+                uca_tb_invalidate(uc, addr, end - addr);
             }
         } else {
             err = UC_ERR_ARG;
@@ -2910,7 +1870,7 @@ uc_err uc_ctl(uc_engine *uc, uc_control_type control, ...)
         UC_INIT(uc);
 
         if (rw == UC_CTL_IO_WRITE) {
-            uc->tb_flush(uc);
+            uca_tb_flush(uc);
         } else {
             err = UC_ERR_ARG;
         }
@@ -2923,7 +1883,7 @@ uc_err uc_ctl(uc_engine *uc, uc_control_type control, ...)
         UC_INIT(uc);
 
         if (rw == UC_CTL_IO_WRITE) {
-            uc->tcg_flush_tlb(uc);
+            uca_tlb_flush(uc);
         } else {
             err = UC_ERR_ARG;
         }
@@ -2937,7 +1897,7 @@ uc_err uc_ctl(uc_engine *uc, uc_control_type control, ...)
 
         if (rw == UC_CTL_IO_WRITE) {
             int mode = va_arg(args, int);
-            err = uc->set_tlb(uc, mode);
+            err = uca_tlb_set_type(uc, mode);
         } else {
             err = UC_ERR_ARG;
         }
@@ -2987,59 +1947,6 @@ uc_err uc_ctl(uc_engine *uc, uc_control_type control, ...)
     return err;
 }
 
-static uc_err uc_snapshot(struct uc_struct *uc)
-{
-    if (uc->unicorn.snapshot_level == INT32_MAX) {
-        return UC_ERR_RESOURCE;
-    }
-    uc->unicorn.snapshot_level++;
-    return UC_ERR_OK;
-}
-
-static uc_err uc_restore_latest_snapshot(struct uc_struct *uc)
-{
-    MemoryRegion *subregion, *subregion_next, *mr, *initial_mr;
-    int level;
-
-    QTAILQ_FOREACH_SAFE(subregion, &uc->system_memory->subregions,
-                        subregions_link, subregion_next)
-    {
-        uc->memory_filter_subregions(subregion, uc->unicorn.snapshot_level);
-        if (subregion->priority >= uc->unicorn.snapshot_level ||
-            (!subregion->terminates && QTAILQ_EMPTY(&subregion->subregions))) {
-            uc->memory_unmap(uc, subregion);
-        }
-    }
-
-    for (size_t i = uc->unmapped_regions->len; i-- > 0;) {
-        mr = g_array_index(uc->unmapped_regions, MemoryRegion *, i);
-        // same dirty hack as in memory_moveout see qemu/softmmu/memory.c
-        initial_mr = QTAILQ_FIRST(&mr->subregions);
-        if (!initial_mr) {
-            initial_mr = mr;
-        }
-        /* same dirty hack as in memory_moveout see qemu/softmmu/memory.c */
-        level = (intptr_t)mr->container;
-        mr->container = NULL;
-
-        if (level < uc->unicorn.snapshot_level) {
-            break;
-        }
-        if (memory_overlap(uc, mr->addr, int128_get64(mr->size))) {
-            return UC_ERR_MAP;
-        }
-        uc->memory_movein(uc, mr);
-        uc->memory_filter_subregions(mr, uc->unicorn.snapshot_level);
-        if (initial_mr != mr && QTAILQ_EMPTY(&mr->subregions)) {
-            uc->memory_unmap(uc, subregion);
-        }
-        mem_map(uc, initial_mr);
-        g_array_remove_range(uc->unmapped_regions, i, 1);
-    }
-    uc->unicorn.snapshot_level--;
-
-    return UC_ERR_OK;
-}
 
 #ifdef UNICORN_TRACER
 uc_tracer *get_tracer()
