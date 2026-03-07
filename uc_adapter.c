@@ -1503,3 +1503,544 @@ void uca_intr_router_free(uc_engine *uc, uca_intr_router *router)
     }
     free(router);
 }
+
+
+/* =========================================================================
+ * Engine lifecycle — QEMU init, teardown
+ * ========================================================================= */
+
+static uc_err default_reg_read_stub(void *env, int mode, unsigned int regid,
+                                    void *value, size_t *size)
+{
+    return UC_ERR_HANDLE;
+}
+
+static uc_err default_reg_write_stub(void *env, int mode, unsigned int regid,
+                                     const void *value, size_t *size,
+                                     int *setpc)
+{
+    return UC_ERR_HANDLE;
+}
+
+/* hook_delete is defined in uc.c and used by the list infrastructure.
+ * Declare it here so the lifecycle functions can reference it. */
+static void ucadapt_hook_delete(void *data)
+{
+    struct hook *h = (struct hook *)data;
+    h->refs--;
+    if (h->refs == 0) {
+        g_hash_table_destroy(h->hooked_regions);
+        free(h);
+    }
+}
+
+static gint ucadapt_exits_cmp(gconstpointer a, gconstpointer b,
+                               gpointer user_data)
+{
+    uint64_t lhs = *((uint64_t *)a);
+    uint64_t rhs = *((uint64_t *)b);
+    return (lhs < rhs) ? -1 : (lhs == rhs) ? 0 : 1;
+}
+
+uc_err uca_engine_alloc(uc_arch arch, uc_mode mode, uc_engine **out)
+{
+    struct uc_struct *uc = calloc(1, sizeof(*uc));
+    if (!uc)
+        return UC_ERR_NOMEM;
+
+    /* QEMU boundary: phys_map_node_reserve() uses alloc_hint */
+    uc->alloc_hint = 16;
+    uc->errnum     = UC_ERR_OK;
+    uc->arch       = arch;
+    uc->mode       = mode;
+    uc->reg_read   = default_reg_read_stub;
+    uc->reg_write  = default_reg_write_stub;
+
+    /* QEMU boundary: initialise QEMU RAM/address-space list heads */
+    QLIST_INIT(&uc->ram_list.blocks);
+    QTAILQ_INIT(&uc->memory_listeners);
+    QTAILQ_INIT(&uc->address_spaces);
+
+    uc->init_done  = false;
+    uc->cpu_model  = INT_MAX; /* default CPU model */
+
+    *out = uc;
+    return UC_ERR_OK;
+}
+
+uc_err uca_engine_init(uc_engine *uc)
+{
+    if (uc->init_done)
+        return UC_ERR_HANDLE;
+
+    uc->unicorn.hooks_to_del.delete_fn = ucadapt_hook_delete;
+    for (int i = 0; i < UC_HOOK_MAX; i++)
+        uc->unicorn.hook[i].delete_fn = ucadapt_hook_delete;
+
+    uc->ctl_exits = g_tree_new_full(ucadapt_exits_cmp, NULL, g_free, NULL);
+
+    /* QEMU boundary: bring up the softmmu machine (CPUs, memory, TCG) */
+    if (machine_initialize(uc))
+        return UC_ERR_RESOURCE;
+
+    /* QEMU boundary: select TLB implementation if not set by arch init */
+    if (!uc->cpu->cc->tlb_fill)
+        uc->set_tlb(uc, UC_TLB_CPU);
+
+    /* QEMU boundary: init softfloat rounding modes */
+    uc->softfloat_initialize();
+
+    if (uc->reg_reset)
+        uc->reg_reset(uc);
+
+    uc->context_content  = UC_CTL_CONTEXT_CPU;
+    uc->unmapped_regions = g_array_new(false, false, sizeof(MemoryRegion *));
+    uc->init_done        = true;
+    return UC_ERR_OK;
+}
+
+uc_err uca_engine_close(uc_engine *uc)
+{
+    int i;
+    MemoryRegion *mr;
+
+    if (!uc->init_done) {
+        free(uc);
+        return UC_ERR_OK;
+    }
+
+    /* QEMU boundary: flush all translated blocks before freeing TCG context */
+    uc->tb_flush(uc);
+
+    /* QEMU boundary: release TCG JIT buffers and internal state */
+    if (uc->release)
+        uc->release(uc->tcg_ctx);
+    g_free(uc->tcg_ctx);
+
+    /* QEMU boundary: free CPU object and its address-space array */
+    g_free(uc->cpu->cpu_ases);
+    g_free(uc->cpu->thread);
+    qemu_vfree(uc->cpu);
+
+    /* QEMU boundary: destroy FlatView cache (hash table) */
+    g_hash_table_destroy(uc->flat_views);
+
+    /* QEMU boundary: call destructor on each MemoryRegion */
+    mr = &uc->io_mem_unassigned;
+    mr->destructor(mr);
+    mr = uc->system_io;
+    mr->destructor(mr);
+    mr = uc->system_memory;
+    mr->destructor(mr);
+    g_free(uc->system_memory);
+    g_free(uc->system_io);
+    for (size_t idx = 0; idx < uc->unmapped_regions->len; idx++) {
+        mr = g_array_index(uc->unmapped_regions, MemoryRegion *, idx);
+        mr->destructor(mr);
+        g_free(mr);
+    }
+    g_array_free(uc->unmapped_regions, true);
+
+    if (uc->qemu_thread_data)
+        g_free(uc->qemu_thread_data);
+
+    g_free(uc->init_target_page);
+    g_free(uc->l1_map);
+
+    if (uc->bounce.buffer)
+        qemu_vfree(uc->bounce.buffer);
+
+    /* Clean up all pending hook deletions, then free every hook list. */
+    {
+        struct list_item *cur;
+        struct hook *hook;
+        for (cur = uc->unicorn.hooks_to_del.head;
+             cur != NULL && (hook = (struct hook *)cur->data);
+             cur = cur->next) {
+            for (i = 0; i < UC_HOOK_MAX; i++)
+                list_remove(&uc->unicorn.hook[i], (void *)hook);
+        }
+        list_clear(&uc->unicorn.hooks_to_del);
+    }
+    for (i = 0; i < UC_HOOK_MAX; i++)
+        list_clear(&uc->unicorn.hook[i]);
+
+    free(uc->unicorn.mapped_blocks);
+    g_tree_destroy(uc->ctl_exits);
+
+    memset(uc, 0, sizeof(*uc));
+    free(uc);
+    return UC_ERR_OK;
+}
+
+
+/* =========================================================================
+ * Register I/O — thin wrappers over uc_struct function pointers
+ *
+ * All CPU register access goes through uc->reg_read / uc->reg_write which
+ * are arch-specific function pointers set during machine_initialize.
+ * break_translation_loop is called after PC-changing writes so the TCG
+ * engine picks up the new PC on the next translation.
+ * ========================================================================= */
+
+uc_err uca_reg_read(uc_engine *uc, int regid, void *value)
+{
+    size_t size = (size_t)-1;
+    /* QEMU boundary: arch-specific register read */
+    return uc->reg_read(uc->cpu->env_ptr, uc->mode, regid, value, &size);
+}
+
+uc_err uca_reg_write(uc_engine *uc, int regid, const void *value)
+{
+    int setpc = 0;
+    size_t size = (size_t)-1;
+    /* QEMU boundary: arch-specific register write */
+    uc_err err = uc->reg_write(uc->cpu->env_ptr, uc->mode, regid, value,
+                               &size, &setpc);
+    if (err)
+        return err;
+    if (setpc) {
+        uc->quit_request = true;
+        uc->skip_sync_pc_on_exit = true;
+        /* QEMU boundary: kick TCG out of the current translation block */
+        break_translation_loop(uc);
+    }
+    return UC_ERR_OK;
+}
+
+uc_err uca_reg_read2(uc_engine *uc, int regid, void *value, size_t *size)
+{
+    /* QEMU boundary: arch-specific register read with size out-param */
+    return uc->reg_read(uc->cpu->env_ptr, uc->mode, regid, value, size);
+}
+
+uc_err uca_reg_write2(uc_engine *uc, int regid, const void *value,
+                      size_t *size)
+{
+    int setpc = 0;
+    /* QEMU boundary: arch-specific register write with size out-param */
+    uc_err err = uc->reg_write(uc->cpu->env_ptr, uc->mode, regid, value,
+                               size, &setpc);
+    if (err)
+        return err;
+    if (setpc) {
+        uc->quit_request = true;
+        /* QEMU boundary: kick TCG out of the current translation block */
+        break_translation_loop(uc);
+    }
+    return UC_ERR_OK;
+}
+
+uc_err uca_reg_read_batch(uc_engine *uc, int const *regs, void **vals,
+                          int count)
+{
+    reg_read_t reg_read = uc->reg_read;
+    void *env  = uc->cpu->env_ptr;
+    int mode   = uc->mode;
+    for (int i = 0; i < count; i++) {
+        size_t size = (size_t)-1;
+        /* QEMU boundary: arch-specific register read */
+        uc_err err = reg_read(env, mode, regs[i], vals[i], &size);
+        if (err)
+            return err;
+    }
+    return UC_ERR_OK;
+}
+
+uc_err uca_reg_write_batch(uc_engine *uc, int const *regs,
+                           void *const *vals, int count)
+{
+    reg_write_t reg_write = uc->reg_write;
+    void *env  = uc->cpu->env_ptr;
+    int mode   = uc->mode;
+    int setpc  = 0;
+    for (int i = 0; i < count; i++) {
+        size_t size = (size_t)-1;
+        /* QEMU boundary: arch-specific register write */
+        uc_err err = reg_write(env, mode, regs[i], vals[i], &size, &setpc);
+        if (err)
+            return err;
+    }
+    if (setpc) {
+        uc->quit_request = true;
+        /* QEMU boundary: kick TCG out of the current translation block */
+        break_translation_loop(uc);
+    }
+    return UC_ERR_OK;
+}
+
+uc_err uca_reg_read_batch2(uc_engine *uc, int const *regs, void *const *vals,
+                           size_t *sizes, int count)
+{
+    reg_read_t reg_read = uc->reg_read;
+    void *env  = uc->cpu->env_ptr;
+    int mode   = uc->mode;
+    for (int i = 0; i < count; i++) {
+        /* QEMU boundary: arch-specific register read with size out-param */
+        uc_err err = reg_read(env, mode, regs[i], vals[i], sizes + i);
+        if (err)
+            return err;
+    }
+    return UC_ERR_OK;
+}
+
+uc_err uca_reg_write_batch2(uc_engine *uc, int const *regs,
+                            const void *const *vals, size_t *sizes, int count)
+{
+    reg_write_t reg_write = uc->reg_write;
+    void *env  = uc->cpu->env_ptr;
+    int mode   = uc->mode;
+    int setpc  = 0;
+    for (int i = 0; i < count; i++) {
+        /* QEMU boundary: arch-specific register write with size out-param */
+        uc_err err = reg_write(env, mode, regs[i], vals[i], sizes + i, &setpc);
+        if (err)
+            return err;
+    }
+    if (setpc) {
+        uc->quit_request = true;
+        /* QEMU boundary: kick TCG out of the current translation block */
+        break_translation_loop(uc);
+    }
+    return UC_ERR_OK;
+}
+
+
+/* =========================================================================
+ * Emulation control — vm_start, timeout, instruction count
+ * ========================================================================= */
+
+#define UCADAPT_TIMEOUT_STEP 2  /* microseconds between timeout polls */
+
+static void *ucadapt_timeout_fn(void *arg)
+{
+    struct uc_struct *uc = arg;
+    int64_t t0 = get_clock();
+    do {
+        usleep(UCADAPT_TIMEOUT_STEP);
+        if (uc->emulation_done)
+            break;
+    } while ((uint64_t)(get_clock() - t0) < uc->timeout);
+
+    if (!uc->emulation_done) {
+        uc->timed_out = true;
+        /* QEMU boundary: inject a stop request into the running VM */
+        uca_emu_stop(uc);
+    }
+    return NULL;
+}
+
+static void ucadapt_hook_count_cb(struct uc_struct *uc, uint64_t address,
+                                   uint32_t size, void *user_data)
+{
+    uc->emu_counter++;
+    if (uc->emu_counter > uc->emu_count)
+        /* QEMU boundary: stop the running emulation */
+        uca_emu_stop(uc);
+}
+
+uc_err uca_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+                     uint64_t timeout, size_t count)
+{
+    uc->emu_counter    = 0;
+    uc->invalid_error  = UC_ERR_OK;
+    uc->emulation_done = false;
+    uc->size_recur_mem = 0;
+    uc->timed_out      = false;
+    uc->first_tb       = true;
+
+    if (uc->nested_level >= UC_MAX_NESTED_LEVEL)
+        return UC_ERR_RESOURCE;
+    uc->nested_level++;
+
+    /* Set the starting PC via the public register-write path so that
+     * all arch-specific PC synchronisation logic runs normally. */
+    uint32_t begin_pc32 = READ_DWORD(begin);
+    switch (uc->arch) {
+    default:
+        break;
+#ifdef UNICORN_HAS_M68K
+    case UC_ARCH_M68K:
+        uca_reg_write(uc, UC_M68K_REG_PC, &begin_pc32);
+        break;
+#endif
+#ifdef UNICORN_HAS_X86
+    case UC_ARCH_X86:
+        switch (uc->mode) {
+        default: break;
+        case UC_MODE_16: {
+            uint16_t ip, cs;
+            uca_reg_read(uc, UC_X86_REG_CS, &cs);
+            ip = (uint16_t)(begin - cs * 16);
+            uca_reg_write(uc, UC_X86_REG_IP, &ip);
+            break;
+        }
+        case UC_MODE_32:
+            uca_reg_write(uc, UC_X86_REG_EIP, &begin_pc32);
+            break;
+        case UC_MODE_64:
+            uca_reg_write(uc, UC_X86_REG_RIP, &begin);
+            break;
+        }
+        break;
+#endif
+#ifdef UNICORN_HAS_ARM
+    case UC_ARCH_ARM:
+        uca_reg_write(uc, UC_ARM_REG_R15, &begin_pc32);
+        break;
+#endif
+#ifdef UNICORN_HAS_ARM64
+    case UC_ARCH_ARM64:
+        uca_reg_write(uc, UC_ARM64_REG_PC, &begin);
+        break;
+#endif
+#ifdef UNICORN_HAS_MIPS
+    case UC_ARCH_MIPS:
+        if (uc->mode & UC_MODE_MIPS64)
+            uca_reg_write(uc, UC_MIPS_REG_PC, &begin);
+        else
+            uca_reg_write(uc, UC_MIPS_REG_PC, &begin_pc32);
+        break;
+#endif
+#ifdef UNICORN_HAS_SPARC
+    case UC_ARCH_SPARC:
+        uca_reg_write(uc, UC_SPARC_REG_PC, &begin);
+        break;
+#endif
+#ifdef UNICORN_HAS_PPC
+    case UC_ARCH_PPC:
+        if (uc->mode & UC_MODE_PPC64)
+            uca_reg_write(uc, UC_PPC_REG_PC, &begin);
+        else
+            uca_reg_write(uc, UC_PPC_REG_PC, &begin_pc32);
+        break;
+#endif
+#ifdef UNICORN_HAS_RISCV
+    case UC_ARCH_RISCV:
+        if (uc->mode & UC_MODE_RISCV64)
+            uca_reg_write(uc, UC_RISCV_REG_PC, &begin);
+        else
+            uca_reg_write(uc, UC_RISCV_REG_PC, &begin_pc32);
+        break;
+#endif
+#ifdef UNICORN_HAS_S390X
+    case UC_ARCH_S390X:
+        uca_reg_write(uc, UC_S390X_REG_PC, &begin);
+        break;
+#endif
+#ifdef UNICORN_HAS_TRICORE
+    case UC_ARCH_TRICORE:
+        uca_reg_write(uc, UC_TRICORE_REG_PC, &begin_pc32);
+        break;
+#endif
+    }
+
+    uc->skip_sync_pc_on_exit = false;
+    uc->stop_request         = false;
+    uc->emu_count            = count;
+
+    /* Remove instruction-count hook when not needed. */
+    if (count == 0 && uc->unicorn.count_hook != 0) {
+        uca_hook_del(uc, uc->unicorn.count_hook);
+        uc->unicorn.count_hook = 0;
+        /* QEMU boundary: flush TB cache so hook removal takes effect */
+        uc->tb_flush(uc);
+    }
+
+    /* Install instruction-count hook when needed. */
+    if (count > 0 && uc->unicorn.count_hook == 0) {
+        uc->unicorn.hook_insert = 1;
+        uc_err herr = uca_hook_add_type(
+            uc, &uc->unicorn.count_hook, UC_HOOK_CODE,
+            ucadapt_hook_count_cb, NULL, 1, 0);
+        uc->unicorn.hook_insert = 0;
+        if (herr != UC_ERR_OK) {
+            uc->nested_level--;
+            return herr;
+        }
+    }
+
+    if (!uc->use_exits)
+        uc->exits[uc->nested_level - 1] = until;
+
+    if (timeout) {
+        uc->timeout = timeout * 1000; /* microseconds → nanoseconds */
+        /* QEMU boundary: create timeout watchdog thread */
+        qemu_thread_create(uc, &uc->timer, "timeout",
+                           ucadapt_timeout_fn, uc, QEMU_THREAD_JOINABLE);
+    }
+
+    /* QEMU boundary: enter the TCG main loop */
+    uc->vm_start(uc);
+
+    uc->nested_level--;
+
+    if (uc->nested_level == 0) {
+        uc->emulation_done = true;
+
+        /* Flush deferred hook deletions at outermost level only. */
+        {
+            struct list_item *cur;
+            struct hook *hook;
+            int i;
+            for (cur = uc->unicorn.hooks_to_del.head;
+                 cur != NULL && (hook = (struct hook *)cur->data);
+                 cur = cur->next) {
+                for (i = 0; i < UC_HOOK_MAX; i++)
+                    if (list_remove(&uc->unicorn.hook[i], (void *)hook))
+                        break;
+            }
+            list_clear(&uc->unicorn.hooks_to_del);
+        }
+    }
+
+    if (timeout)
+        /* QEMU boundary: join the timeout watchdog thread */
+        qemu_thread_join(&uc->timer);
+
+    uc_err err = uc->invalid_error;
+    uc->invalid_error = 0;
+    return err;
+}
+
+uc_err uca_emu_stop(uc_engine *uc)
+{
+    uc->stop_request = true;
+    /* QEMU boundary: break out of the TCG translation loop immediately */
+    return break_translation_loop(uc);
+}
+
+
+/* =========================================================================
+ * Query
+ * ========================================================================= */
+
+uc_err uca_query(uc_engine *uc, uc_query_type type, size_t *result)
+{
+    switch (type) {
+    default:
+        return UC_ERR_ARG;
+
+    case UC_QUERY_PAGE_SIZE:
+        *result = uc->target_page_size;
+        break;
+
+    case UC_QUERY_ARCH:
+        *result = uc->arch;
+        break;
+
+    case UC_QUERY_MODE:
+#ifdef UNICORN_HAS_ARM
+        if (uc->arch == UC_ARCH_ARM)
+            /* QEMU boundary: ARM Thumb/ARM mode query via arch backend */
+            return uc->query(uc, type, result);
+#endif
+        *result = uc->mode;
+        break;
+
+    case UC_QUERY_TIMEOUT:
+        *result = uc->timed_out;
+        break;
+    }
+    return UC_ERR_OK;
+}

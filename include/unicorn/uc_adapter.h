@@ -293,6 +293,72 @@ uc_err uca_mem_regions(uc_engine *uc, uc_mem_region **regions,
 
 
 /* =========================================================================
+ * Engine lifecycle
+ * ========================================================================= */
+
+/**
+ * Allocate and zero-initialise a fresh uc_struct.
+ * Sets arch, mode, and default reg_read/reg_write stubs.
+ * Does NOT call machine_initialize — that happens lazily on first use.
+ */
+uc_err uca_engine_alloc(uc_arch arch, uc_mode mode, uc_engine **out);
+
+/**
+ * Initialise the QEMU backend for an already-allocated engine.
+ * Called once, lazily, on first API use.  Idiomatic callers use UC_INIT.
+ */
+uc_err uca_engine_init(uc_engine *uc);
+
+/**
+ * Tear down and free an engine created by uca_engine_alloc / uc_open.
+ * If init was never completed, only the uc_struct itself is freed.
+ */
+uc_err uca_engine_close(uc_engine *uc);
+
+
+/* =========================================================================
+ * Register read / write
+ * ========================================================================= */
+
+uc_err uca_reg_read(uc_engine *uc, int regid, void *value);
+uc_err uca_reg_write(uc_engine *uc, int regid, const void *value);
+uc_err uca_reg_read2(uc_engine *uc, int regid, void *value, size_t *size);
+uc_err uca_reg_write2(uc_engine *uc, int regid, const void *value,
+                      size_t *size);
+uc_err uca_reg_read_batch(uc_engine *uc, int const *regs, void **vals,
+                          int count);
+uc_err uca_reg_write_batch(uc_engine *uc, int const *regs,
+                           void *const *vals, int count);
+uc_err uca_reg_read_batch2(uc_engine *uc, int const *regs, void *const *vals,
+                           size_t *sizes, int count);
+uc_err uca_reg_write_batch2(uc_engine *uc, int const *regs,
+                            const void *const *vals, size_t *sizes, int count);
+
+
+/* =========================================================================
+ * Emulation control
+ * ========================================================================= */
+
+/**
+ * Start emulation at @begin, stopping at @until (or via exits/hooks).
+ * @timeout is in microseconds (0 = no limit).  @count limits instruction
+ * count (0 = unlimited).
+ */
+uc_err uca_emu_start(uc_engine *uc, uint64_t begin, uint64_t until,
+                     uint64_t timeout, size_t count);
+
+/** Request the emulation loop to stop at the next safe point. */
+uc_err uca_emu_stop(uc_engine *uc);
+
+
+/* =========================================================================
+ * Query
+ * ========================================================================= */
+
+uc_err uca_query(uc_engine *uc, uc_query_type type, size_t *result);
+
+
+/* =========================================================================
  * Interrupt router
  * ========================================================================= */
 
